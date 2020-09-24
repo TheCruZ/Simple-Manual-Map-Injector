@@ -137,8 +137,8 @@ bool ManualMap(HANDLE hProc, const wchar_t* szDllFile)
 	printf("Data allocated\n");
 
 #ifdef _DEBUG
-	printf("my shellcode pointer %p", Shellcode);
-	printf("target point %p\n", pShellcode);
+	printf("My shellcode pointer %p\n", Shellcode);
+	printf("Target point %p\n", pShellcode);
 	system("pause");
 #endif
 
@@ -160,7 +160,7 @@ bool ManualMap(HANDLE hProc, const wchar_t* szDllFile)
 		DWORD exitcode = 0;
 		GetExitCodeProcess(hProc, &exitcode);
 		if (exitcode != STILL_ACTIVE) {
-			printf("Process crashed\n");
+			printf("Process crashed, exit code: %d\n", exitcode);
 			delete[] pSrcData;
 			return false;
 		}

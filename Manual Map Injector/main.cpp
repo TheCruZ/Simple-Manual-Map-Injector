@@ -65,7 +65,7 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[])
 	}
 
 	if (PID == 0) {
-		printf("Process not found");
+		printf("Process not found\n");
 		system("pause");
 		return -1;
 	}
