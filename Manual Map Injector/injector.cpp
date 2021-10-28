@@ -12,7 +12,7 @@
 #define CURRENT_ARCH IMAGE_FILE_MACHINE_I386
 #endif
 
-bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, DWORD fdwReason, LPVOID lpReserved) {
+bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, DWORD fdwReason, LPVOID lpReserved) {
 	IMAGE_NT_HEADERS* pOldNtHeader = nullptr;
 	IMAGE_OPTIONAL_HEADER* pOldOptHeader = nullptr;
 	IMAGE_FILE_HEADER* pOldFileHeader = nullptr;
@@ -46,9 +46,16 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 	MANUAL_MAPPING_DATA data{ 0 };
 	data.pLoadLibraryA = LoadLibraryA;
 	data.pGetProcAddress = GetProcAddress;
+#ifdef _WIN64
+	data.pRtlAddFunctionTable = (f_RtlAddFunctionTable)RtlAddFunctionTable;
+#else 
+	SEHExceptionSupport = false;
+#endif
 	data.pbase = pTargetBase;
 	data.fdwReasonParam = fdwReason;
 	data.reservedParam = lpReserved;
+	data.SEHSupport = SEHExceptionSupport;
+
 
 	//File header
 	if (!WriteProcessMemory(hProc, pTargetBase, pSrcData, 0x1000, nullptr)) { //only first 0x1000 bytes for the header
@@ -144,6 +151,9 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 			VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
 			return false;
 		}
+		else if (hCheck == (HINSTANCE)0x505050) {
+			ILog("WARNING: Exception support failed!\n");
+		}
 
 		Sleep(10);
 	}
@@ -168,7 +178,7 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 		pSectionHeader = IMAGE_FIRST_SECTION(pOldNtHeader);
 		for (UINT i = 0; i != pOldFileHeader->NumberOfSections; ++i, ++pSectionHeader) {
 			if (pSectionHeader->Misc.VirtualSize) {
-				if (strcmp((char*)pSectionHeader->Name, ".pdata") == 0 ||
+				if ((SEHExceptionSupport ? 0 : strcmp((char*)pSectionHeader->Name, ".pdata") == 0) ||
 					strcmp((char*)pSectionHeader->Name, ".rsrc") == 0 ||
 					strcmp((char*)pSectionHeader->Name, ".reloc") == 0) {
 					ILog("Processing %s removal\n", pSectionHeader->Name);
@@ -240,6 +250,9 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 
 	auto _LoadLibraryA = pData->pLoadLibraryA;
 	auto _GetProcAddress = pData->pGetProcAddress;
+#ifdef _WIN64
+	auto _RtlAddFunctionTable = pData->pRtlAddFunctionTable;
+#endif
 	auto _DllMain = reinterpret_cast<f_DLL_ENTRY_POINT>(pBase + pOpt->AddressOfEntryPoint);
 
 	BYTE* LocationDelta = pBase - pOpt->ImageBase;
@@ -293,7 +306,27 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 			(*pCallback)(pBase, DLL_PROCESS_ATTACH, nullptr);
 	}
 
+	bool ExceptionSupportFailed = false;
+
+#ifdef _WIN64
+
+	if (pData->SEHSupport) {
+		auto excep = pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+		if (excep.Size) {
+			if (!_RtlAddFunctionTable(
+				reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(pBase + excep.VirtualAddress),
+				excep.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY), (DWORD64)pBase)) {
+				ExceptionSupportFailed = true;
+			}
+		}
+	}
+
+#endif
+
 	_DllMain(pBase, pData->fdwReasonParam, pData->reservedParam);
 
-	pData->hMod = reinterpret_cast<HINSTANCE>(pBase);
+	if (ExceptionSupportFailed)
+		pData->hMod = reinterpret_cast<HINSTANCE>(0x505050);
+	else
+		pData->hMod = reinterpret_cast<HINSTANCE>(pBase);
 }
