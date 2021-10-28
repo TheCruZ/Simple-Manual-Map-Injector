@@ -259,7 +259,8 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 	if (LocationDelta) {
 		if (pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size) {
 			auto* pRelocData = reinterpret_cast<IMAGE_BASE_RELOCATION*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
-			while (pRelocData->VirtualAddress) {
+			const auto* pRelocEnd = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<uintptr_t>(pRelocData) + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size);
+			while (pRelocData < pRelocEnd && pRelocData->SizeOfBlock) {
 				UINT AmountOfEntries = (pRelocData->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
 				WORD* pRelativeInfo = reinterpret_cast<WORD*>(pRelocData + 1);
 
