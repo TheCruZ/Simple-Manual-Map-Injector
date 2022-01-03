@@ -29,6 +29,7 @@ DWORD GetProcessIdByName(wchar_t* name) {
 	if (Process32First(snapshot, &entry) == TRUE) {
 		while (Process32Next(snapshot, &entry) == TRUE) {
 			if (_wcsicmp(entry.szExeFile, name) == 0) {
+				CloseHandle(snapshot); //thanks to Pvt Comfy
 				return entry.th32ProcessID;
 			}
 		}
@@ -101,6 +102,8 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 
 	if (GetFileAttributes(dllPath) == INVALID_FILE_ATTRIBUTES) {
 		printf("Dll file doesn't exist\n");
+		CloseHandle(hProc);
+		system("PAUSE");
 		return -4;
 	}
 
@@ -109,6 +112,8 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 	if (File.fail()) {
 		printf("Opening the file failed: %X\n", (DWORD)File.rdstate());
 		File.close();
+		CloseHandle(hProc);
+		system("PAUSE");
 		return -5;
 	}
 
@@ -116,6 +121,8 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 	if (FileSize < 0x1000) {
 		printf("Filesize invalid.\n");
 		File.close();
+		CloseHandle(hProc);
+		system("PAUSE");
 		return -6;
 	}
 
@@ -123,6 +130,8 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 	if (!pSrcData) {
 		printf("Can't allocate dll file.\n");
 		File.close();
+		CloseHandle(hProc);
+		system("PAUSE");
 		return -7;
 	}
 
