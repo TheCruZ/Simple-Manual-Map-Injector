@@ -1,0 +1,7 @@
+@PACKAGE_INIT@ # Init
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(MSPDBX)
+
+include(${CMAKE_CURRENT_LIST_DIR}/thecruz-manualmap-targets.cmake)

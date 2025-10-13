@@ -12,7 +12,35 @@
 #define CURRENT_ARCH IMAGE_FILE_MACHINE_I386
 #endif
 
-bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, DWORD fdwReason, LPVOID lpReserved) {
+std::optional<uint64_t> GetLdrpHandleTlsDataRVA()
+{
+	return 0x54590;
+}
+
+std::optional<HMODULE> GetModuleBaseAddress(DWORD processID, const char* moduleName) {
+	HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processID);
+	if (hSnapshot == INVALID_HANDLE_VALUE) {
+		return std::nullopt;
+	}
+
+	MODULEENTRY32 moduleEntry;
+	moduleEntry.dwSize = sizeof(MODULEENTRY32);
+
+	if (Module32First(hSnapshot, &moduleEntry)) {
+		do {
+			if (strcmp(moduleEntry.szModule, moduleName) == 0) {
+				CloseHandle(hSnapshot);
+				return moduleEntry.hModule;  // Return the base address
+			}
+		} while (Module32Next(hSnapshot, &moduleEntry));
+	}
+
+	CloseHandle(hSnapshot);
+	return std::nullopt;  // Return nullopt if the module was not found
+}
+
+std::optional<void*> ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, DWORD fdwReason, LPVOID lpReserved) {
+	auto procNtdll = GetModuleBaseAddress(GetProcessId(hProc), "ntdll.dll");
 	IMAGE_NT_HEADERS* pOldNtHeader = nullptr;
 	IMAGE_OPTIONAL_HEADER* pOldOptHeader = nullptr;
 	IMAGE_FILE_HEADER* pOldFileHeader = nullptr;
@@ -20,7 +48,7 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 
 	if (reinterpret_cast<IMAGE_DOS_HEADER*>(pSrcData)->e_magic != 0x5A4D) { //"MZ"
 		ILog("Invalid file\n");
-		return false;
+		return std::nullopt;
 	}
 
 	pOldNtHeader = reinterpret_cast<IMAGE_NT_HEADERS*>(pSrcData + reinterpret_cast<IMAGE_DOS_HEADER*>(pSrcData)->e_lfanew);
@@ -29,7 +57,7 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 
 	if (pOldFileHeader->Machine != CURRENT_ARCH) {
 		ILog("Invalid platform\n");
-		return false;
+		return std::nullopt;
 	}
 
 	ILog("File ok\n");
@@ -37,13 +65,47 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 	pTargetBase = reinterpret_cast<BYTE*>(VirtualAllocEx(hProc, nullptr, pOldOptHeader->SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
 	if (!pTargetBase) {
 		ILog("Target process memory allocation failed (ex) 0x%X\n", GetLastError());
-		return false;
+		return std::nullopt;
 	}
+
+	std::unique_ptr<BYTE[]> emptyBuffStrg = std::make_unique<BYTE[]>(1024 * 1024 * 20);
+	BYTE* emptyBuffer = emptyBuffStrg.get();
+	if (emptyBuffer == nullptr) {
+		ILog("Unable to allocate memory\n");
+		return std::nullopt;
+	}
+	memset(emptyBuffer, 0, 1024 * 1024 * 20);
 
 	DWORD oldp = 0;
 	VirtualProtectEx(hProc, pTargetBase, pOldOptHeader->SizeOfImage, PAGE_EXECUTE_READWRITE, &oldp);
-
+	
 	MANUAL_MAPPING_DATA data{ 0 };
+	data.pDummyLdr = (LDR_DATA_TABLE_ENTRY*)VirtualAllocEx(hProc, nullptr, sizeof(LDR_DATA_TABLE_ENTRY) * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE); 
+	WriteProcessMemory(hProc, data.pDummyLdr, emptyBuffer, sizeof(LDR_DATA_TABLE_ENTRY) * 4, nullptr);
+	data.pLdrpHandleTlsData = [&]() -> f_LdrpHandleTlsData {
+		if (!procNtdll)
+			return nullptr;
+
+		auto rva = GetLdrpHandleTlsDataRVA();
+
+		if (!rva)
+		{
+			ILog("LdrpHandleTlsData Not found\n");
+			return nullptr;
+		}
+
+		auto r = (f_LdrpHandleTlsData)((uint64_t)(*procNtdll) + *rva);
+
+		// Hash Like Integrity Check
+		if (*(uint16_t*)r != 0x8948 ||
+			*(uint16_t*)((char*)r + 5) != 0x8948)
+		{
+			ILog("LdrpHandleTlsData Integrity Check Failed\n");
+			return nullptr;
+		}
+
+		return r;
+		}();
 	data.pLoadLibraryA = LoadLibraryA;
 	data.pGetProcAddress = GetProcAddress;
 #ifdef _WIN64
@@ -61,7 +123,7 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 	if (!WriteProcessMemory(hProc, pTargetBase, pSrcData, 0x1000, nullptr)) { //only first 0x1000 bytes for the header
 		ILog("Can't write file header 0x%X\n", GetLastError());
 		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
-		return false;
+		return std::nullopt;
 	}
 
 	IMAGE_SECTION_HEADER* pSectionHeader = IMAGE_FIRST_SECTION(pOldNtHeader);
@@ -70,7 +132,7 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 			if (!WriteProcessMemory(hProc, pTargetBase + pSectionHeader->VirtualAddress, pSrcData + pSectionHeader->PointerToRawData, pSectionHeader->SizeOfRawData, nullptr)) {
 				ILog("Can't map sections: 0x%x\n", GetLastError());
 				VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
-				return false;
+				return std::nullopt;
 			}
 		}
 	}
@@ -80,14 +142,14 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 	if (!MappingDataAlloc) {
 		ILog("Target process mapping allocation failed (ex) 0x%X\n", GetLastError());
 		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
-		return false;
+		return std::nullopt;
 	}
 
 	if (!WriteProcessMemory(hProc, MappingDataAlloc, &data, sizeof(MANUAL_MAPPING_DATA), nullptr)) {
 		ILog("Can't write mapping 0x%X\n", GetLastError());
 		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
 		VirtualFreeEx(hProc, MappingDataAlloc, 0, MEM_RELEASE);
-		return false;
+		return std::nullopt;
 	}
 
 	//Shell code
@@ -96,7 +158,7 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 		ILog("Memory shellcode allocation failed (ex) 0x%X\n", GetLastError());
 		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
 		VirtualFreeEx(hProc, MappingDataAlloc, 0, MEM_RELEASE);
-		return false;
+		return std::nullopt;
 	}
 
 	if (!WriteProcessMemory(hProc, pShellcode, Shellcode, 0x1000, nullptr)) {
@@ -104,7 +166,7 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
 		VirtualFreeEx(hProc, MappingDataAlloc, 0, MEM_RELEASE);
 		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
-		return false;
+		return std::nullopt;
 	}
 
 	ILog("Mapped DLL at %p\n", pTargetBase);
@@ -125,7 +187,7 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 		VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
 		VirtualFreeEx(hProc, MappingDataAlloc, 0, MEM_RELEASE);
 		VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
-		return false;
+		return std::nullopt;
 	}
 	CloseHandle(hThread);
 
@@ -137,7 +199,7 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 		GetExitCodeProcess(hProc, &exitcode);
 		if (exitcode != STILL_ACTIVE) {
 			ILog("Process crashed, exit code: %d\n", exitcode);
-			return false;
+			return std::nullopt;
 		}
 
 		MANUAL_MAPPING_DATA data_checked{ 0 };
@@ -149,7 +211,7 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 			VirtualFreeEx(hProc, pTargetBase, 0, MEM_RELEASE);
 			VirtualFreeEx(hProc, MappingDataAlloc, 0, MEM_RELEASE);
 			VirtualFreeEx(hProc, pShellcode, 0, MEM_RELEASE);
-			return false;
+			return std::nullopt;
 		}
 		else if (hCheck == (HINSTANCE)0x505050) {
 			ILog("WARNING: Exception support failed!\n");
@@ -157,13 +219,6 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 
 		Sleep(10);
 	}
-
-	BYTE* emptyBuffer = (BYTE*)malloc(1024 * 1024 * 20);
-	if (emptyBuffer == nullptr) {
-		ILog("Unable to allocate memory\n");
-		return false;
-	}
-	memset(emptyBuffer, 0, 1024 * 1024 * 20);
 
 	//CLEAR PE HEAD
 	if (ClearHeader) {
@@ -225,7 +280,7 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 		ILog("WARNING: can't release mapping data memory\n");
 	}
 
-	return true;
+	return pTargetBase;
 }
 
 #define RELOC_FLAG32(RelInfo) ((RelInfo >> 0x0C) == IMAGE_REL_BASED_HIGHLOW)
@@ -299,6 +354,17 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 			++pImportDescr;
 		}
 	}
+
+	if (pData->pLdrpHandleTlsData)
+	{
+		pData->pDummyLdr->DllBase = pBase;
+		pData->pLdrpHandleTlsData(pData->pDummyLdr);
+	}
+
+	/*Todo
+	* Unlink from TLS list pData->pDummyLdr
+	* Finally release pData->pDummyLdr
+	*/
 
 	if (pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size) {
 		auto* pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
