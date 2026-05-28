@@ -14,8 +14,13 @@ jobs:
 
     strategy:
       matrix:
-        platform: [x64, Win32]
-        configuration: [Release]
+        include:
+          - platform: x64
+            output_dir: x64
+            artifact_name: Injector-x64
+          - platform: x86
+            output_dir: Win32
+            artifact_name: Injector-x86
 
     steps:
       - name: Checkout
@@ -30,12 +35,12 @@ jobs:
             -y --ignore-package-exit-codes=3010
           Write-Host "VS 2026 Build Tools installation completed"
 
-      - name: Build ${{ matrix.platform }} ${{ matrix.configuration }}
+      - name: Build ${{ matrix.platform }} Release
         shell: cmd
         run: |
           call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat"
           msbuild "Manual Map Injector.sln" /m ^
-            /p:Configuration=${{ matrix.configuration }} ^
+            /p:Configuration=Release ^
             /p:Platform=${{ matrix.platform }} ^
             /fl /flp:logfile=msbuild-${{ matrix.platform }}.log
 
@@ -49,10 +54,10 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Injector-${{ matrix.platform }}
+          name: ${{ matrix.artifact_name }}
           path: |
-            ${{ matrix.platform }}/${{ matrix.configuration }}/*.exe
-            ${{ matrix.platform }}/${{ matrix.configuration }}/*.pdb
+            ${{ matrix.output_dir }}/Release/*.exe
+            ${{ matrix.output_dir }}/Release/*.pdb
 
   release:
     needs: build
