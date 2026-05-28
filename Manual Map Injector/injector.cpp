@@ -56,6 +56,80 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 	data.reservedParam = lpReserved;
 	data.SEHSupport = SEHExceptionSupport;
 
+#ifdef _WIN64
+	// Build the _CxxThrowException replacement stub. x64 calling convention:
+	// rcx = exception object, rdx = ThrowInfo*. We assemble a 4-slot params
+	// array on the stack and call RaiseException with our correct ImageBase
+	// in slot 3 — that's the bit the original _CxxThrowException can't fill
+	// in for a manually-mapped DLL, because RtlPcToFileHeader can't find us.
+	data.pCxxThrowStub = nullptr;
+	if (SEHExceptionSupport) {
+		HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
+		FARPROC pRaiseEx = hK32 ? GetProcAddress(hK32, "RaiseException") : nullptr;
+		void* stubMem = pRaiseEx
+			? VirtualAllocEx(hProc, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+			: nullptr;
+
+		if (!stubMem) {
+			ILog("WARNING: couldn't allocate CxxThrow stub; typed catches may fail\n");
+		} else {
+			// One page in the target holds three things:
+			//   offset 0x000: stub code         (79 bytes)
+			//   offset 0x080: UNWIND_INFO       (8 bytes)
+			//   offset 0x0A0: RUNTIME_FUNCTION  (12 bytes)
+			// The shellcode then RtlAddFunctionTable's the RUNTIME_FUNCTION so
+			// the OS unwinder can walk past the stub's frame when looking for
+			// a C++ EH handler in the caller.
+			BYTE blob[0xB0] = {};
+			BYTE stub[] = {
+				0x48, 0x83, 0xEC, 0x48,                                  // sub  rsp, 0x48
+				0xC7, 0x44, 0x24, 0x20, 0x20, 0x05, 0x93, 0x19,          // mov  [rsp+0x20], 0x19930520 (EH_MAGIC_NUMBER1)
+				0xC7, 0x44, 0x24, 0x24, 0x00, 0x00, 0x00, 0x00,          // mov  [rsp+0x24], 0
+				0x48, 0x89, 0x4C, 0x24, 0x28,                            // mov  [rsp+0x28], rcx ; obj
+				0x48, 0x89, 0x54, 0x24, 0x30,                            // mov  [rsp+0x30], rdx ; ThrowInfo
+				0x48, 0xB8, 0,0,0,0,0,0,0,0,                             // movabs rax, IMAGE_BASE  (patched at offset 32)
+				0x48, 0x89, 0x44, 0x24, 0x38,                            // mov  [rsp+0x38], rax  ; param[3]
+				0xB9, 0x63, 0x73, 0x6D, 0xE0,                            // mov  ecx, 0xE06D7363
+				0xBA, 0x01, 0x00, 0x00, 0x00,                            // mov  edx, 1 (NONCONTINUABLE)
+				0x41, 0xB8, 0x04, 0x00, 0x00, 0x00,                      // mov  r8d, 4
+				0x4C, 0x8D, 0x4C, 0x24, 0x20,                            // lea  r9, [rsp+0x20]
+				0x48, 0xB8, 0,0,0,0,0,0,0,0,                             // movabs rax, RaiseException (patched at offset 68)
+				0xFF, 0xD0,                                              // call rax
+				0xCC,                                                    // int3 (never reached)
+			};
+			ULONG_PTR imageBase = (ULONG_PTR)pTargetBase;
+			ULONG_PTR raiseExceptionAddr = (ULONG_PTR)pRaiseEx;
+			memcpy(stub + 32, &imageBase, 8);
+			memcpy(stub + 68, &raiseExceptionAddr, 8);
+			memcpy(blob, stub, sizeof(stub));
+
+			// UNWIND_INFO at offset 0x80:
+			//   Version=1 Flags=0 | SizeOfProlog=4 | CountOfCodes=1 | FrameRegister=0
+			//   UnwindCode: { CodeOffset=4, UnwindOp=UWOP_ALLOC_SMALL(2), OpInfo=(0x48/8)-1=8 }
+			blob[0x80] = 0x01;        // Version 1, flags 0
+			blob[0x81] = 0x04;        // SizeOfProlog (sub rsp, 0x48 is 4 bytes)
+			blob[0x82] = 0x01;        // CountOfCodes
+			blob[0x83] = 0x00;        // FrameRegister/FrameOffset
+			blob[0x84] = 0x04;        // CodeOffset
+			blob[0x85] = 0x82;        // (OpInfo=8 << 4) | UWOP_ALLOC_SMALL(2)
+
+			// RUNTIME_FUNCTION at offset 0xA0: { BeginAddr, EndAddr, UnwindData } as RVAs from stubMem.
+			DWORD beginAddr = 0;
+			DWORD endAddr   = (DWORD)sizeof(stub);
+			DWORD unwindRva = 0x80;
+			memcpy(blob + 0xA0, &beginAddr, 4);
+			memcpy(blob + 0xA4, &endAddr,   4);
+			memcpy(blob + 0xA8, &unwindRva, 4);
+
+			if (WriteProcessMemory(hProc, stubMem, blob, sizeof(blob), nullptr)) {
+				data.pCxxThrowStub = stubMem;
+			} else {
+				ILog("WARNING: couldn't write CxxThrow stub\n");
+			}
+		}
+	}
+#endif
+
 
 	//File header
 	if (!WriteProcessMemory(hProc, pTargetBase, pSrcData, 0x1000, nullptr)) { //only first 0x1000 bytes for the header
@@ -132,11 +206,18 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 	ILog("Thread created at: %p, waiting for return...\n", pShellcode);
 
 	HINSTANCE hCheck = NULL;
+	DWORD tStart = GetTickCount();
+	const DWORD kInjectTimeoutMs = 30000;
 	while (!hCheck) {
 		DWORD exitcode = 0;
 		GetExitCodeProcess(hProc, &exitcode);
 		if (exitcode != STILL_ACTIVE) {
-			ILog("Process crashed, exit code: %d\n", exitcode);
+			ILog("Process crashed, exit code: 0x%08X\n", exitcode);
+			return false;
+		}
+
+		if (GetTickCount() - tStart > kInjectTimeoutMs) {
+			ILog("Injection timed out after %u ms (DllMain may be hung)\n", kInjectTimeoutMs);
 			return false;
 		}
 
@@ -293,7 +374,24 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 				}
 				else {
 					auto* pImport = reinterpret_cast<IMAGE_IMPORT_BY_NAME*>(pBase + (*pThunkRef));
-					*pFuncRef = (ULONG_PTR)_GetProcAddress(hDll, pImport->Name);
+#ifdef _WIN64
+					// Detect "_CxxThrowException" by name (char-by-char to avoid
+					// referencing string literals from the injector's .rdata).
+					const char* n = pImport->Name;
+					bool isCxxThrow =
+						pData->pCxxThrowStub &&
+						n[0] == '_' && n[1] == 'C' && n[2] == 'x' && n[3] == 'x' &&
+						n[4] == 'T' && n[5] == 'h' && n[6] == 'r' && n[7] == 'o' &&
+						n[8] == 'w' && n[9] == 'E' && n[10] == 'x' && n[11] == 'c' &&
+						n[12] == 'e' && n[13] == 'p' && n[14] == 't' && n[15] == 'i' &&
+						n[16] == 'o' && n[17] == 'n' && n[18] == '\0';
+					if (isCxxThrow) {
+						*pFuncRef = (ULONG_PTR)pData->pCxxThrowStub;
+					} else
+#endif
+					{
+						*pFuncRef = (ULONG_PTR)_GetProcAddress(hDll, pImport->Name);
+					}
 				}
 			}
 			++pImportDescr;
@@ -319,6 +417,15 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 				excep.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY), (DWORD64)pBase)) {
 				ExceptionSupportFailed = true;
 			}
+		}
+
+		// Register the CxxThrow stub's own RUNTIME_FUNCTION so the OS unwinder
+		// can walk through it on its way back to the throw site's frame.
+		if (pData->pCxxThrowStub) {
+			BYTE* stubBase = static_cast<BYTE*>(pData->pCxxThrowStub);
+			_RtlAddFunctionTable(
+				reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(stubBase + 0xA0),
+				1, (DWORD64)stubBase);
 		}
 	}
 

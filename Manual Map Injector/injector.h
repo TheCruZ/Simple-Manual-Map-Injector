@@ -27,6 +27,17 @@ struct MANUAL_MAPPING_DATA
 	DWORD fdwReasonParam;
 	LPVOID reservedParam;
 	BOOL SEHSupport;
+
+#ifdef _WIN64
+	// Stub that replaces the DLL's imported _CxxThrowException. The original
+	// _CxxThrowException calls RtlPcToFileHeader(_ReturnAddress()) to obtain
+	// the throwing module's ImageBase for ExceptionInformation[3]; that API
+	// can't find a manually-mapped DLL, returns 0, and __CxxFrameHandler*
+	// then resolves the throw's catchable-type RVAs against the null page,
+	// so typed catches never match. The stub hardcodes our ImageBase and
+	// calls RaiseException directly.
+	void* pCxxThrowStub;
+#endif
 };
 
 
