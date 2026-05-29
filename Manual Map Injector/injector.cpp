@@ -306,6 +306,8 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 		ILog("WARNING: can't release mapping data memory\n");
 	}
 
+	free(emptyBuffer);
+
 	return true;
 }
 
