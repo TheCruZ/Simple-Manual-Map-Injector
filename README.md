@@ -15,5 +15,5 @@
 ## Devs
 
 - Add **DISABLE_OUTPUT** definition if you want to disable injector.cpp output
-- main.cpp is just an example but powerfull
+- main.cpp is just an example but powerful
 - Hello World dlls added from https://github.com/carterjones/hello-world-dll for easy testing
