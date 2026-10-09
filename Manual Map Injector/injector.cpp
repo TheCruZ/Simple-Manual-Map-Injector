@@ -1,9 +1,10 @@
 #include "injector.h"
+#include "Pattern.h"
 
 #if defined(DISABLE_OUTPUT)
 #define ILog(data, ...)
 #else
-#define ILog(text, ...) printf(text, __VA_ARGS__);
+#define ILog(text, ...) printf(text, ##__VA_ARGS__);
 #endif
 
 #ifdef _WIN64
@@ -12,7 +13,7 @@
 #define CURRENT_ARCH IMAGE_FILE_MACHINE_I386
 #endif
 
-bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, DWORD fdwReason, LPVOID lpReserved) {
+bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, bool ClearHeader, bool ClearNonNeededSections, bool AdjustProtections, bool SEHExceptionSupport, bool TLSSupport, DWORD fdwReason, LPVOID lpReserved) {
 	IMAGE_NT_HEADERS* pOldNtHeader = nullptr;
 	IMAGE_OPTIONAL_HEADER* pOldOptHeader = nullptr;
 	IMAGE_FILE_HEADER* pOldFileHeader = nullptr;
@@ -44,17 +45,35 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 	VirtualProtectEx(hProc, pTargetBase, pOldOptHeader->SizeOfImage, PAGE_EXECUTE_READWRITE, &oldp);
 
 	MANUAL_MAPPING_DATA data{ 0 };
-	data.pLoadLibraryA = LoadLibraryA;
+	data.pLoadLibraryA   = LoadLibraryA;
 	data.pGetProcAddress = GetProcAddress;
 #ifdef _WIN64
 	data.pRtlAddFunctionTable = (f_RtlAddFunctionTable)RtlAddFunctionTable;
-#else 
+
+
+	if (HMODULE hNtdll = GetModuleHandleA("ntdll.dll")) {
+		DWORD64 hit = Pattern::ScanPatternInSection(
+			hNtdll, ".text",
+			"44 8D ? 09 [5-24] B2 01 48 8B ? 30 E8");
+		if (hit) {
+			DWORD64 padHit = Pattern::ScanBackward(hit - 0x400, 0x400, "CC CC CC");
+			if (padHit) {
+				BYTE* p = (BYTE*)padHit;
+				while (*p == 0xCC) ++p;
+				data.pLdrpHandleTlsData = (f_LdrpHandleTlsData)p;
+			}
+		}
+		if (!data.pLdrpHandleTlsData)
+			ILog("WARNING: couldn't resolve LdrpHandleTlsData; static TLS will be unavailable\n");
+	}
+#else
 	SEHExceptionSupport = false;
 #endif
 	data.pbase = pTargetBase;
 	data.fdwReasonParam = fdwReason;
 	data.reservedParam = lpReserved;
 	data.SEHSupport = SEHExceptionSupport;
+	data.TLSSupport = TLSSupport;
 
 #ifdef _WIN64
 	// Build the _CxxThrowException replacement stub. x64 calling convention:
@@ -125,6 +144,45 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 				data.pCxxThrowStub = stubMem;
 			} else {
 				ILog("WARNING: couldn't write CxxThrow stub\n");
+			}
+		}
+
+		// RtlPcToFileHeader trampoline
+		HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+		FARPROC pOrigRtlPc = hNtdll ? GetProcAddress(hNtdll, "RtlPcToFileHeader") : nullptr;
+		if (pOrigRtlPc) {
+			void* trMem = VirtualAllocEx(hProc, nullptr, 0x1000,
+				MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+			if (trMem) {
+				BYTE tr[0x40] = {};
+				BYTE code[] = {
+					0x48, 0xB8, 0,0,0,0,0,0,0,0,     // movabs rax, pBase
+					0x48, 0x39, 0xC1,                 // cmp rcx, rax
+					0x72, 0x18,                       // jb +24
+					0x49, 0xB8, 0,0,0,0,0,0,0,0,     // movabs r8, pBase_end
+					0x4C, 0x39, 0xC1,                 // cmp rcx, r8
+					0x73, 0x09,                       // jae +9
+					0x48, 0x85, 0xD2,                 // test rdx, rdx
+					0x74, 0x03,                       // jz +3
+					0x48, 0x89, 0x02,                 // mov [rdx], rax
+					0xC3,                             // ret
+					// not_ours:
+					0x48, 0xB8, 0,0,0,0,0,0,0,0,     // movabs rax, pOrigRtlPc
+					0xFF, 0xE0                        // jmp rax
+				};
+				ULONG_PTR imgBase = (ULONG_PTR)pTargetBase;
+				ULONG_PTR imgEnd  = imgBase + pOldOptHeader->SizeOfImage;
+				ULONG_PTR origAddr = (ULONG_PTR)pOrigRtlPc;
+				memcpy(code + 2,    &imgBase, 8);   // pBase inside movabs rax
+				memcpy(code + 0x11, &imgEnd,  8);   // pBase_end inside movabs r8
+				memcpy(code + 0x29, &origAddr, 8);  // original inside movabs rax
+				memcpy(tr, code, sizeof(code));
+
+				if (WriteProcessMemory(hProc, trMem, tr, sizeof(tr), nullptr)) {
+					data.pRtlPcTrampoline = trMem;
+				} else {
+					ILog("WARNING: couldn't write RtlPcToFileHeader trampoline\n");
+				}
 			}
 		}
 	}
@@ -322,6 +380,8 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, SIZE_T FileSize, bool ClearHeade
 
 #pragma runtime_checks( "", off )
 #pragma optimize( "", off )
+
+__declspec(safebuffers)
 void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 	if (!pData) {
 		pData->hMod = (HINSTANCE)0x404040;
@@ -387,8 +447,21 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 						n[8] == 'w' && n[9] == 'E' && n[10] == 'x' && n[11] == 'c' &&
 						n[12] == 'e' && n[13] == 'p' && n[14] == 't' && n[15] == 'i' &&
 						n[16] == 'o' && n[17] == 'n' && n[18] == '\0';
+					// Detect "RtlPcToFileHeader" by name. Routing it through
+					// our trampoline makes /MT's static _CxxThrowException
+					// see our pBase as the ImageBase, so RTTI-based catch
+					// works the same way as under /MD.
+					bool isRtlPc =
+						pData->pRtlPcTrampoline &&
+						n[0] == 'R' && n[1] == 't' && n[2] == 'l' && n[3] == 'P' &&
+						n[4] == 'c' && n[5] == 'T' && n[6] == 'o' && n[7] == 'F' &&
+						n[8] == 'i' && n[9] == 'l' && n[10] == 'e' && n[11] == 'H' &&
+						n[12] == 'e' && n[13] == 'a' && n[14] == 'd' && n[15] == 'e' &&
+						n[16] == 'r' && n[17] == '\0';
 					if (isCxxThrow) {
 						*pFuncRef = (ULONG_PTR)pData->pCxxThrowStub;
+					} else if (isRtlPc) {
+						*pFuncRef = (ULONG_PTR)pData->pRtlPcTrampoline;
 					} else
 #endif
 					{
@@ -400,29 +473,22 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 		}
 	}
 
-	if (pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size) {
-		auto* pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
-		auto* pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks);
-		for (; pCallback && *pCallback; ++pCallback)
-			(*pCallback)(pBase, DLL_PROCESS_ATTACH, nullptr);
-	}
-
-	bool ExceptionSupportFailed = false;
-
+	// --- .pdata registration (DLL's unwind info) -----------------------
+	// Must happen BEFORE any DLL code runs, so that C++ exceptions thrown
+	// from TLS callbacks (which execute first) find valid handlers.
+	bool EarlyEHRegFailed = false;
 #ifdef _WIN64
-
 	if (pData->SEHSupport) {
-		auto excep = pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-		if (excep.Size) {
+		auto excep0 = pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+		if (excep0.Size) {
 			if (!_RtlAddFunctionTable(
-				reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(pBase + excep.VirtualAddress),
-				excep.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY), (DWORD64)pBase)) {
-				ExceptionSupportFailed = true;
+				reinterpret_cast<IMAGE_RUNTIME_FUNCTION_ENTRY*>(pBase + excep0.VirtualAddress),
+				excep0.Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY), (DWORD64)pBase)) {
+				EarlyEHRegFailed = true;
 			}
 		}
-
-		// Register the CxxThrow stub's own RUNTIME_FUNCTION so the OS unwinder
-		// can walk through it on its way back to the throw site's frame.
+		// Also register the CxxThrowException stub's RUNTIME_FUNCTION
+		// (same reason: it can fire from the very first TLS callback).
 		if (pData->pCxxThrowStub) {
 			BYTE* stubBase = static_cast<BYTE*>(pData->pCxxThrowStub);
 			_RtlAddFunctionTable(
@@ -430,12 +496,30 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 				1, (DWORD64)stubBase);
 		}
 	}
+#endif
 
+#ifdef _WIN64
+	// --- TLS support ----------------------------------------------------
+	if (pData->TLSSupport && pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size
+	    && pData->pLdrpHandleTlsData) {
+		auto* pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
+
+		BYTE fakeEntry[0x200] = { 0 };
+		*(void**)(fakeEntry + 0x30) = pBase;             // DllBase
+		*(DWORD*)(fakeEntry + 0x40) = pOpt->SizeOfImage; // SizeOfImage
+		pData->pLdrpHandleTlsData(fakeEntry, 1);
+
+		// ntdll only wires _tls_index and allocates the per-thread block;
+		// the DLL's own TLS callbacks still need firing by us.
+		auto* pCallback = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(pTLS->AddressOfCallBacks);
+		for (; pCallback && *pCallback; ++pCallback)
+			(*pCallback)(pBase, DLL_PROCESS_ATTACH, nullptr);
+	}
 #endif
 
 	_DllMain(pBase, pData->fdwReasonParam, pData->reservedParam);
 
-	if (ExceptionSupportFailed)
+	if (EarlyEHRegFailed)
 		pData->hMod = reinterpret_cast<HINSTANCE>(0x505050);
 	else
 		pData->hMod = reinterpret_cast<HINSTANCE>(pBase);

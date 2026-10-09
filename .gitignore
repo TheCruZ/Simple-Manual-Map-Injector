@@ -360,3 +360,25 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# ====== tests/ build artefacts ======
+# The tests/ tree builds throwaway DLLs with cl.exe (see each sub-folder's
+# build.cmd / build_all.ps1). Keep the sources but ignore the compiled
+# outputs. *.obj / *.pdb / *.ilk / *.log are already covered above; here
+# we add the output types that aren't globally ignored because the repo
+# ships hello-world-x{64,86}*.dll at the root as test fixtures.
+tests/**/*.dll
+tests/**/*.exp
+tests/**/*.lib
+tests/**/*.exe
+
+# Build intermediate dirs created by MSBuild inside each test project
+tests/**/[Dd]ebug/
+tests/**/[Rr]elease/
+tests/**/[Xx]64/
+tests/**/[Xx]86/
+tests/**/[Ww]in32/
+
+# Visual Studio project user files inside tests/
+tests/**/*.vcxproj.user
+tests/**/*.vcxproj.filters.user

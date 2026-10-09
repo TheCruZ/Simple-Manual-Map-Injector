@@ -39,33 +39,102 @@ DWORD GetProcessIdByName(wchar_t* name) {
 	return 0;
 }
 
+static bool IsAllDigits(const wchar_t* s) {
+	if (!s || !*s) return false;
+	for (const wchar_t* p = s; *p; ++p) {
+		if (*p < L'0' || *p > L'9') return false;
+	}
+	return true;
+}
+
+
+static DWORD ResolveTargetPid(wchar_t* target) {
+	if (IsAllDigits(target)) {
+		DWORD pid = (DWORD)_wtoi64(target);
+		if (pid != 0) {
+			HANDLE probe = OpenProcess(SYNCHRONIZE, FALSE, pid);
+			if (probe) {
+				CloseHandle(probe);
+				return pid;
+			}
+			if (GetLastError() == ERROR_ACCESS_DENIED) {
+				return pid;
+			}
+		}
+		// Fall through: no process has that PID. Try as a name.
+	}
+	return GetProcessIdByName(target);
+}
+
+static HANDLE SpawnSuspended(wchar_t* exePath, PROCESS_INFORMATION* outPi) {
+	STARTUPINFOW si{};
+	si.cb = sizeof(si);
+	ZeroMemory(outPi, sizeof(*outPi));
+
+	// Mutable copy for CreateProcessW (the lpCommandLine buffer may be
+	// modified by the API).
+	size_t len = wcslen(exePath) + 1;
+	wchar_t* cmd = new wchar_t[len];
+	wcscpy_s(cmd, len, exePath);
+
+	BOOL ok = CreateProcessW(
+		exePath, cmd, nullptr, nullptr, FALSE,
+		CREATE_SUSPENDED, nullptr, nullptr, &si, outPi);
+	delete[] cmd;
+
+	if (!ok) {
+		printf("CreateProcessW failed: 0x%X\n", GetLastError());
+		return nullptr;
+	}
+	printf("Dummy process launched suspended. PID=%u TID=%u\n",
+	       outPi->dwProcessId, outPi->dwThreadId);
+	return outPi->hProcess;
+}
+
 int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 
-	wchar_t* dllPath;
-	DWORD PID;
-	if (argc == 3) {
+	wchar_t* dllPath = nullptr;
+	DWORD PID = 0;
+	PROCESS_INFORMATION spawnedPi{};
+	bool spawnMode = false;
+	HANDLE hProc = nullptr;
+
+	if (argc == 4 && _wcsicmp(argv[1], L"--spawn") == 0) {
+		dllPath = argv[2];
+		spawnMode = true;
+		hProc = SpawnSuspended(argv[3], &spawnedPi);
+		if (!hProc) {
+			system("PAUSE");
+			return -2;
+		}
+		PID = spawnedPi.dwProcessId;
+	}
+	else if (argc == 3) {
 		dllPath = argv[1];
-		PID = GetProcessIdByName(argv[2]);
+		PID = ResolveTargetPid(argv[2]);
 	}
 	else if (argc == 2) {
 		dllPath = argv[1];
 		std::string pname;
-		printf("Process Name:\n");
+		printf("Process (name or PID):\n");
 		std::getline(std::cin, pname);
 
 		char* vIn = (char*)pname.c_str();
 		wchar_t* vOut = new wchar_t[strlen(vIn) + 1];
 		mbstowcs_s(NULL, vOut, strlen(vIn) + 1, vIn, strlen(vIn));
-		PID = GetProcessIdByName(vOut);
+		PID = ResolveTargetPid(vOut);
+		delete[] vOut;
 	}
 	else {
 		printf("Invalid Params\n");
-		printf("Usage: dll_path [process_name]\n");
+		printf("Usage:\n");
+		printf("  Injector dll_path [target]            (target: process name or PID)\n");
+		printf("  Injector --spawn dll_path exe_path    (launches a suspended dummy process)\n");
 		system("pause");
 		return 0;
 	}
 
-	if (PID == 0) {
+	if (!spawnMode && PID == 0) {
 		printf("Process not found\n");
 		system("pause");
 		return -1;
@@ -85,24 +154,46 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 		CloseHandle(hToken);
 	}
 
-	HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, PID);
+	if (!spawnMode) {
+		hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, PID);
+	}
 	if (!hProc) {
 		DWORD Err = GetLastError();
 		printf("OpenProcess failed: 0x%X\n", Err);
+		if (spawnMode && spawnedPi.hThread) {
+			TerminateProcess(spawnedPi.hProcess, 1);
+			CloseHandle(spawnedPi.hThread);
+			CloseHandle(spawnedPi.hProcess);
+		}
 		system("PAUSE");
 		return -2;
 	}
 
+	// Clean close + terminate for error paths in spawn mode: a suspended
+	// process with closed handles stays alive (and stuck) until something
+	// executes its first thread or kills it.
+	auto cleanupTarget = [&]() {
+		if (spawnMode) {
+			TerminateProcess(hProc, 1);
+			if (spawnedPi.hThread)  CloseHandle(spawnedPi.hThread);
+			if (spawnedPi.hProcess) CloseHandle(spawnedPi.hProcess);
+			spawnedPi.hThread = spawnedPi.hProcess = nullptr;
+		} else if (hProc) {
+			CloseHandle(hProc);
+		}
+		hProc = nullptr;
+	};
+
 	if (!IsCorrectTargetArchitecture(hProc)) {
 		printf("Invalid Process Architecture.\n");
-		CloseHandle(hProc);
+		cleanupTarget();
 		system("PAUSE");
 		return -3;
 	}
 
 	if (GetFileAttributes(dllPath) == INVALID_FILE_ATTRIBUTES) {
 		printf("Dll file doesn't exist\n");
-		CloseHandle(hProc);
+		cleanupTarget();
 		system("PAUSE");
 		return -4;
 	}
@@ -112,7 +203,7 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 	if (File.fail()) {
 		printf("Opening the file failed: %X\n", (DWORD)File.rdstate());
 		File.close();
-		CloseHandle(hProc);
+		cleanupTarget();
 		system("PAUSE");
 		return -5;
 	}
@@ -121,7 +212,7 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 	if (FileSize < 0x1000) {
 		printf("Filesize invalid.\n");
 		File.close();
-		CloseHandle(hProc);
+		cleanupTarget();
 		system("PAUSE");
 		return -6;
 	}
@@ -130,7 +221,7 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 	if (!pSrcData) {
 		printf("Can't allocate dll file.\n");
 		File.close();
-		CloseHandle(hProc);
+		cleanupTarget();
 		system("PAUSE");
 		return -7;
 	}
@@ -140,16 +231,24 @@ int wmain(int argc, wchar_t* argv[], wchar_t* envp[]) {
 	File.close();
 
 	printf("Mapping...\n");
-	if (!ManualMapDll(hProc, pSrcData, FileSize)) {
+	if (!ManualMapDll(hProc, pSrcData)) {
 		delete[] pSrcData;
-		CloseHandle(hProc);
+		cleanupTarget();
 		printf("Error while mapping.\n");
 		system("PAUSE");
 		return -8;
 	}
 	delete[] pSrcData;
 
-	CloseHandle(hProc);
+	if (spawnMode) {
+		printf("Resuming dummy's main thread...\n");
+		if (ResumeThread(spawnedPi.hThread) == (DWORD)-1)
+			printf("ResumeThread failed: 0x%X\n", GetLastError());
+		CloseHandle(spawnedPi.hThread);
+		CloseHandle(spawnedPi.hProcess);
+	} else {
+		CloseHandle(hProc);
+	}
 	printf("OK\n");
 	return 0;
 }
