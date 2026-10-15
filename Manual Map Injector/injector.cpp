@@ -378,8 +378,12 @@ bool ManualMapDll(HANDLE hProc, BYTE* pSrcData, bool ClearHeader, bool ClearNonN
 #define RELOC_FLAG RELOC_FLAG32
 #endif
 
+#if defined(__clang__)
+#pragma clang optimize off
+#else
 #pragma runtime_checks( "", off )
 #pragma optimize( "", off )
+#endif
 
 __declspec(safebuffers)
 void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
@@ -504,7 +508,14 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 	    && pData->pLdrpHandleTlsData) {
 		auto* pTLS = reinterpret_cast<IMAGE_TLS_DIRECTORY*>(pBase + pOpt->DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
 
+		#ifdef __clang__
+		BYTE fakeEntry[0x200];
+		for (int i = 0; i < 0x200; ++i) {
+			fakeEntry[i] = 0;
+		}
+#else
 		BYTE fakeEntry[0x200] = { 0 };
+#endif
 		*(void**)(fakeEntry + 0x30) = pBase;             // DllBase
 		*(DWORD*)(fakeEntry + 0x40) = pOpt->SizeOfImage; // SizeOfImage
 		pData->pLdrpHandleTlsData(fakeEntry, 1);
@@ -524,3 +535,10 @@ void __stdcall Shellcode(MANUAL_MAPPING_DATA* pData) {
 	else
 		pData->hMod = reinterpret_cast<HINSTANCE>(pBase);
 }
+
+#if defined(__clang__)
+#pragma clang optimize on
+#else
+#pragma optimize( "", on )
+#pragma runtime_checks( "", restore )
+#endif
